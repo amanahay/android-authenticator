@@ -9,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -76,6 +77,8 @@ private fun AuthenticatorApp() {
     val store = remember { AccountStore(context) }
     val accounts = remember { mutableStateListOf<OtpAccount>() }
     var showAddDialog by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
+    var showSyncDialog by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) { accounts.addAll(store.load()) }
@@ -91,10 +94,25 @@ private fun AuthenticatorApp() {
         if (account == null) message = "QR bukan kode TOTP yang didukung."
         else add(account)
     }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val text = runCatching { context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: error("File tidak dapat dibaca.") }
+            .getOrElse { message = "File backup tidak dapat dibaca."; return@rememberLauncherForActivityResult }
+        val existing = accounts.map { it.identity() }.toSet()
+        val added = importOtpAuthText(text).filter { it.identity() !in existing }
+        if (added.isEmpty()) message = "Tidak ada akun baru pada file backup."
+        else { accounts.addAll(added); store.save(accounts); message = "Berhasil menambahkan ${added.size} akun dari backup." }
+    }
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching { context.contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { it.write(accounts.joinToString("\n") { account -> account.toOtpAuthUri() }) } ?: error("File tidak dapat dibuat.") }
+            .onSuccess { message = "Backup berhasil dibuat. Pilih Google Drive untuk menyimpannya ke Drive." }
+            .onFailure { message = "Backup tidak dapat dibuat." }
+    }
 
     MaterialTheme {
         Scaffold(
-            topBar = { TopAppBar(title = { Text("Android Authenticator") }) },
+            topBar = { TopAppBar(title = { Text("Amanah Authenticator") }) },
             floatingActionButton = {
                 FloatingActionButton(onClick = { showAddDialog = true }) { Text("+") }
             },
@@ -112,6 +130,8 @@ private fun AuthenticatorApp() {
                     Button(onClick = {
                         scanLauncher.launch(ScanOptions().setPrompt("Pindai QR TOTP").setBeepEnabled(false))
                     }) { Text("Pindai QR") }
+                    Spacer(Modifier.height(8.dp))
+                    Button(onClick = { importLauncher.launch("text/plain") }) { Text("Impor backup ekstensi") }
                 }
             } else {
                 LazyColumn(
@@ -127,6 +147,10 @@ private fun AuthenticatorApp() {
                             scanLauncher.launch(ScanOptions().setPrompt("Pindai QR TOTP").setBeepEnabled(false))
                         }, modifier = Modifier.fillMaxWidth()) { Text("Pindai QR baru") }
                     }
+                    item { Button(onClick = { importLauncher.launch("text/plain") }, modifier = Modifier.fillMaxWidth()) { Text("Impor backup ekstensi") } }
+                    item { Button(onClick = { exportLauncher.launch("amanah-authenticator-backup.txt") }, modifier = Modifier.fillMaxWidth()) { Text("Buat backup / simpan ke Google Drive") } }
+                    item { Button(onClick = { showSyncDialog = true }, modifier = Modifier.fillMaxWidth()) { Text("Tentang sinkronisasi Google") } }
+                    item { Button(onClick = { showAboutDialog = true }, modifier = Modifier.fillMaxWidth()) { Text("Tentang aplikasi") } }
                 }
             }
         }
@@ -143,7 +167,29 @@ private fun AuthenticatorApp() {
             Button(onClick = { message = null }) { Text("OK") }
         }, title = { Text("Tidak dapat menambahkan akun") }, text = { Text(text) })
     }
+    if (showAboutDialog) AboutDialog { showAboutDialog = false }
+    if (showSyncDialog) GoogleSyncDialog(
+        onDismiss = { showSyncDialog = false },
+        onCreateBackup = { showSyncDialog = false; exportLauncher.launch("amanah-authenticator-backup.txt") },
+    )
 }
+
+@Composable
+private fun AboutDialog(onDismiss: () -> Unit) = AlertDialog(
+    onDismissRequest = onDismiss,
+    confirmButton = { Button(onClick = onDismiss) { Text("Tutup") } },
+    title = { Text("Amanah Authenticator") },
+    text = { Text("Gratis, tanpa iklan, dan offline-first.\n\nPengembang: Yohan Apriandi\nEmail: yohanapriandii@gmail.com\nAlamat: Bandung\nKontak: 083164970454") },
+)
+
+@Composable
+private fun GoogleSyncDialog(onDismiss: () -> Unit, onCreateBackup: () -> Unit) = AlertDialog(
+    onDismissRequest = onDismiss,
+    confirmButton = { Button(onClick = onCreateBackup) { Text("Buat backup ke Drive") } },
+    dismissButton = { Button(onClick = onDismiss) { Text("Tutup") } },
+    title = { Text("Sinkronisasi Google Drive") },
+    text = { Text("Pilih Google Drive setelah menekan tombol backup. Sinkronisasi otomatis antar perangkat memerlukan konfigurasi Google OAuth milik pengembang dan akan ditambahkan setelah Client ID Android tersedia.") },
+)
 
 @Composable
 private fun OtpCard(account: OtpAccount) {
@@ -235,6 +281,25 @@ private fun parseOtpAuthUri(value: String): OtpAccount? = runCatching {
     require(decodeBase32(secret).isNotEmpty())
     OtpAccount(issuer, name, secret, uri.getQueryParameter("algorithm")?.uppercase() ?: "SHA1", uri.getQueryParameter("digits")?.toIntOrNull() ?: 6, uri.getQueryParameter("period")?.toIntOrNull() ?: 30)
 }.getOrNull()
+
+private fun importOtpAuthText(text: String): List<OtpAccount> =
+    Regex("otpauth://[^\\s]+").findAll(text)
+        .mapNotNull { parseOtpAuthUri(it.value.trimEnd('.', ',', ';')) }
+        .distinctBy { it.identity() }
+        .toList()
+
+private fun OtpAccount.identity(): String = "$issuer\u0000$name\u0000$secret"
+
+private fun OtpAccount.toOtpAuthUri(): String = Uri.Builder()
+    .scheme("otpauth")
+    .authority("totp")
+    .appendPath(if (issuer.isBlank()) name else "$issuer:$name")
+    .appendQueryParameter("secret", secret)
+    .appendQueryParameter("issuer", issuer)
+    .appendQueryParameter("algorithm", algorithm)
+    .appendQueryParameter("digits", digits.toString())
+    .appendQueryParameter("period", period.toString())
+    .build().toString()
 
 private fun generateTotp(account: OtpAccount): String {
     val counter = System.currentTimeMillis() / 1_000L / account.period
