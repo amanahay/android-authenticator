@@ -79,9 +79,13 @@ private fun AuthenticatorApp() {
     var showAddDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showSyncDialog by remember { mutableStateOf(false) }
+    var showOAuthDialog by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+    var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
     var message by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) { accounts.addAll(store.load()) }
+    LaunchedEffect(Unit) { while (true) { nowMillis = System.currentTimeMillis(); kotlinx.coroutines.delay(1_000) } }
 
     fun add(account: OtpAccount) {
         accounts.add(account)
@@ -109,6 +113,15 @@ private fun AuthenticatorApp() {
             .onSuccess { message = "Backup berhasil dibuat. Pilih Google Drive untuk menyimpannya ke Drive." }
             .onFailure { message = "Backup tidak dapat dibuat." }
     }
+    val oauthJsonLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching { context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: error("JSON tidak dapat dibaca.") }
+            .onSuccess { json -> if (json.contains("client_id")) { store.saveOAuthJson(json); message = "OAuth JSON tersimpan lokal." } else message = "File bukan konfigurasi OAuth Android yang valid." }
+            .onFailure { message = "OAuth JSON tidak dapat dibaca." }
+    }
+    val visibleAccounts = accounts.filter { account ->
+        query.isBlank() || account.issuer.contains(query, true) || account.name.contains(query, true)
+    }.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.issuer.ifBlank { it.name } })
 
     MaterialTheme {
         Scaffold(
@@ -138,9 +151,12 @@ private fun AuthenticatorApp() {
                     modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    item { Spacer(Modifier.height(2.dp)) }
-                    items(accounts, key = { "${it.issuer}:${it.name}:${it.secret}" }) { account ->
-                        OtpCard(account)
+                    item {
+                        OutlinedTextField(query, { query = it }, label = { Text("Cari akun atau penerbit") }, modifier = Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                    }
+                    items(visibleAccounts, key = { "${it.issuer}:${it.name}:${it.secret}" }) { account ->
+                        OtpCard(account, nowMillis)
                     }
                     item {
                         Button(onClick = {
@@ -171,6 +187,13 @@ private fun AuthenticatorApp() {
     if (showSyncDialog) GoogleSyncDialog(
         onDismiss = { showSyncDialog = false },
         onCreateBackup = { showSyncDialog = false; exportLauncher.launch("amanah-authenticator-backup.txt") },
+        onConfigureOAuth = { showSyncDialog = false; showOAuthDialog = true },
+    )
+    if (showOAuthDialog) OAuthDialog(
+        store = store,
+        onDismiss = { showOAuthDialog = false },
+        onImportJson = { oauthJsonLauncher.launch("application/json") },
+        onSaved = { sha -> store.saveOAuthSha1(sha); showOAuthDialog = false; message = "SHA-1 konfigurasi OAuth tersimpan lokal." },
     )
 }
 
@@ -183,16 +206,28 @@ private fun AboutDialog(onDismiss: () -> Unit) = AlertDialog(
 )
 
 @Composable
-private fun GoogleSyncDialog(onDismiss: () -> Unit, onCreateBackup: () -> Unit) = AlertDialog(
+private fun GoogleSyncDialog(onDismiss: () -> Unit, onCreateBackup: () -> Unit, onConfigureOAuth: () -> Unit) = AlertDialog(
     onDismissRequest = onDismiss,
     confirmButton = { Button(onClick = onCreateBackup) { Text("Buat backup ke Drive") } },
-    dismissButton = { Button(onClick = onDismiss) { Text("Tutup") } },
+    dismissButton = { Row { Button(onClick = onConfigureOAuth) { Text("Konfigurasi OAuth") }; Button(onClick = onDismiss) { Text("Tutup") } } },
     title = { Text("Sinkronisasi Google Drive") },
     text = { Text("Pilih Google Drive setelah menekan tombol backup. Sinkronisasi otomatis antar perangkat memerlukan konfigurasi Google OAuth milik pengembang dan akan ditambahkan setelah Client ID Android tersedia.") },
 )
 
 @Composable
-private fun OtpCard(account: OtpAccount) {
+private fun OAuthDialog(store: AccountStore, onDismiss: () -> Unit, onImportJson: () -> Unit, onSaved: (String) -> Unit) {
+    var sha1 by remember { mutableStateOf(store.loadOAuthSha1()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Konfigurasi OAuth Android") },
+        text = { Column { Text("Impor JSON OAuth dari Google Cloud, lalu masukkan SHA-1 sertifikat aplikasi. Konfigurasi disimpan terenkripsi di perangkat."); Spacer(Modifier.height(8.dp)); Button(onClick = onImportJson) { Text("Impor OAuth JSON") }; OutlinedTextField(sha1, { sha1 = it }, label = { Text("SHA-1 sertifikat") }, modifier = Modifier.fillMaxWidth()) } },
+        confirmButton = { Button(onClick = { onSaved(sha1.trim()) }) { Text("Simpan") } },
+        dismissButton = { Button(onClick = onDismiss) { Text("Batal") } },
+    )
+}
+
+@Composable
+private fun OtpCard(account: OtpAccount, nowMillis: Long) {
     val context = LocalContext.current
     var code by remember { mutableStateOf(generateTotp(account)) }
     LaunchedEffect(account) {
@@ -206,6 +241,8 @@ private fun OtpCard(account: OtpAccount) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(account.issuer.ifBlank { "TOTP" }, fontWeight = FontWeight.Bold)
                 Text(account.name, style = MaterialTheme.typography.bodyMedium)
+                val remaining = account.period - ((nowMillis / 1_000L) % account.period).toInt()
+                Text("Refresh ${remaining} dtk", style = MaterialTheme.typography.bodySmall)
             }
             Button(onClick = {
                 val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -269,6 +306,10 @@ private class AccountStore(context: Context) {
         }) }
         preferences.edit().putString("accounts", array.toString()).apply()
     }
+
+    fun saveOAuthJson(json: String) { preferences.edit().putString("oauth_json", json).apply() }
+    fun saveOAuthSha1(sha1: String) { preferences.edit().putString("oauth_sha1", sha1).apply() }
+    fun loadOAuthSha1(): String = preferences.getString("oauth_sha1", "") ?: ""
 }
 
 private fun parseOtpAuthUri(value: String): OtpAccount? = runCatching {
