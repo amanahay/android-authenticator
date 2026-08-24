@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
@@ -241,7 +240,9 @@ private fun generateTotp(account: OtpAccount): String {
     val counter = System.currentTimeMillis() / 1_000L / account.period
     val data = ByteBuffer.allocate(8).putLong(counter).array()
     val algorithm = when (account.algorithm.uppercase()) { "SHA256" -> "HmacSHA256"; "SHA512" -> "HmacSHA512"; else -> "HmacSHA1" }
-    val hash = Mac.getInstance(algorithm).doFinal(data, SecretKeySpec(decodeBase32(account.secret), algorithm))
+    val mac = Mac.getInstance(algorithm)
+    mac.init(SecretKeySpec(decodeBase32(account.secret), algorithm))
+    val hash = mac.doFinal(data)
     val offset = hash.last().toInt() and 0x0f
     val binary = ((hash[offset].toInt() and 0x7f) shl 24) or ((hash[offset + 1].toInt() and 0xff) shl 16) or ((hash[offset + 2].toInt() and 0xff) shl 8) or (hash[offset + 3].toInt() and 0xff)
     return (binary % 10.0.pow(account.digits).toInt()).toString().padStart(account.digits, '0')
